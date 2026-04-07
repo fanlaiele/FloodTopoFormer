@@ -13,10 +13,8 @@ FloodTopoFormer is an integrated geospatial tool for urban flood extraction, top
 
 ### Python
 - Python >= 3.8
-- Required packages:
-```bash
 
-
+  
 ## GEE scripts
 - `EPWM.txt`: Generates the Enhanced Permanent Water Mask (EPWM).
 - `SARwater.txt`: Extracts water bodies from Sentinel-1 SAR imagery.
