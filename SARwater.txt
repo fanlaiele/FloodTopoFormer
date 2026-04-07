@@ -1,0 +1,78 @@
+var roi = table;
+Map.centerObject(roi, 10);
+Map.addLayer(roi.style({color: 'red', fillColor: '00000000'}), {}, '研究区边界');
+
+var startDate = '2023-06-01';
+var endDate = '2023-08-31';
+
+var s1vh = ee.ImageCollection("COPERNICUS/S1_GRD")
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select('VH');
+
+function applyLeeFilter(image) {
+  var vh = image.select('VH');
+  var mean = vh.focal_mean({radius: 30, units: 'meters'});
+  return image.addBands(mean.rename('VH'), null, true);
+}
+var s1_filtered = s1vh.map(applyLeeFilter);
+
+var medianVH = s1_filtered.median().clip(roi);
+Map.addLayer(medianVH, {min: -25, max: -5}, 'Median VH (Filtered)');
+
+function computeOtsu(image, region) {
+  var hist = image.reduceRegion({
+    reducer: ee.Reducer.histogram(),
+    geometry: region,
+    scale: 10,
+    maxPixels: 1e13,
+    bestEffort: true
+  }).get('VH');
+
+  hist = ee.Dictionary(hist);
+  var counts = ee.Array(hist.get('histogram'));
+  var means = ee.Array(hist.get('bucketMeans'));
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var meanTotal = sum.divide(total);
+
+  var bss = ee.List.sequence(1, counts.length().get([0]).subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var counts1 = counts.slice(0, 0, i);
+    var counts2 = counts.slice(0, i);
+    var means1 = means.slice(0, 0, i);
+    var means2 = means.slice(0, i);
+    var weight1 = counts1.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var weight2 = counts2.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean1 = means1.multiply(counts1).reduce(ee.Reducer.sum(), [0]).get([0]).divide(weight1);
+    var mean2 = means2.multiply(counts2).reduce(ee.Reducer.sum(), [0]).get([0]).divide(weight2);
+    return weight1.multiply(mean1.subtract(meanTotal).pow(2))
+           .add(weight2.multiply(mean2.subtract(meanTotal).pow(2)));
+  });
+
+  var maxBss = ee.Array(bss).reduce(ee.Reducer.max(), [0]);
+  var index = ee.Array(bss).toList().indexOf(maxBss.get([0]));
+  return ee.Number(means.toList().get(index));
+}
+var threshold = ee.Number(computeOtsu(medianVH, roi));
+print('Otsu 阈值 (dB):', threshold);
+
+var water = medianVH.lt(threshold).selfMask();
+
+var finalMask = water
+  .updateMask(slopeMask)
+  .updateMask(handMask);
+var floodMask = finalMask;
+
+Map.addLayer(floodMask.updateMask(floodMask), {palette: ['blue']}, 'Flood Mask');
+
+Export.image.toDrive({
+  image: floodMask.unmask(0).toByte(),
+  description: 'Flood_Mask',
+  fileNamePrefix: 'SAR_Mask',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13
+});

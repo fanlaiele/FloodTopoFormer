@@ -1,0 +1,113 @@
+var roi = table; // 南京区域边界
+var startDate = '2023-06-01';
+var endDate = '2023-08-31';
+var s2_sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60));
+
+var s2_cloud = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+  .filterBounds(roi)
+  .filterDate(startDate, endDate);
+
+var s2_joined = ee.Join.saveFirst('cloud_mask').apply({
+  primary: s2_sr,
+  secondary: s2_cloud,
+  condition: ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+});
+
+function maskClouds(image) {
+  var cloudProb = ee.Image(image.get('cloud_mask')).select('probability');
+  var mask = cloudProb.lt(40); // 阈值可调
+  return image.updateMask(mask).divide(10000);
+}
+
+var s2_masked = ee.ImageCollection(s2_joined)
+  .map(maskClouds)
+  .map(function(image) {
+    return image.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']);
+  });
+
+var s2_median = s2_masked.median().clip(roi);
+
+var mndwi = s2_median.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+Map.centerObject(roi, 10);
+Map.addLayer(mndwi, {min: -0.5, max: 0.5, palette: ['brown', 'white', 'blue']}, 'MNDWI');
+
+function computeOtsu(image, region) {
+  var hist = image.reduceRegion({
+    reducer: ee.Reducer.histogram(),
+    geometry: region,
+    scale: 10,
+    maxPixels: 1e13,
+    bestEffort: true
+  }).get('MNDWI');
+
+  hist = ee.Dictionary(hist);
+  var counts = ee.Array(hist.get('histogram'));
+  var means = ee.Array(hist.get('bucketMeans'));
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var meanTotal = sum.divide(total);
+
+  var bss = ee.List.sequence(1, counts.length().get([0]).subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var counts1 = counts.slice(0, 0, i);
+    var counts2 = counts.slice(0, i);
+    var means1 = means.slice(0, 0, i);
+    var means2 = means.slice(0, i);
+    var weight1 = counts1.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var weight2 = counts2.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean1 = means1.multiply(counts1).reduce(ee.Reducer.sum(), [0]).get([0]).divide(weight1);
+    var mean2 = means2.multiply(counts2).reduce(ee.Reducer.sum(), [0]).get([0]).divide(weight2);
+    return weight1.multiply(mean1.subtract(meanTotal).pow(2))
+           .add(weight2.multiply(mean2.subtract(meanTotal).pow(2)));
+  });
+
+  var maxBss = ee.Array(bss).reduce(ee.Reducer.max(), [0]);
+  var index = ee.Array(bss).toList().indexOf(maxBss.get([0]));
+  return ee.Number(means.toList().get(index));
+}
+
+var threshold = computeOtsu(mndwi, roi);
+print('Otsu 阈值 (MNDWI):', threshold);
+
+var waterMask = mndwi.gt(threshold).unmask(0).toByte();
+var waterMask_filtered = waterMask;
+
+Export.image.toDrive({
+  image: s2_median,
+  description: 'S2_Median_Nanjing_CloudProbMasked',
+  fileNamePrefix: 'S2_Median_Nanjing_CloudProbMasked',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: waterMask_filtered.reproject({crs: 'EPSG:4326', scale: 10}),
+  description: 'MNDWI_Water_Mask_Nanjing',
+  fileNamePrefix: 'MNDWI_Water_Mask_Nanjing',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var SAR_watermask = image;
+var compare = SAR_watermask.rename('predicted')
+  .addBands(waterMask_filtered.rename('reference'));
+
+var sample = compare.sample({
+  region: roi,
+  scale: 10,
+  numPixels: 5000,
+  seed: 42,
+  geometries: true
+});
+
+var confMatrix = sample.errorMatrix('reference', 'predicted');
+print('Confusion Matrix:', confMatrix);
+print('Overall Accuracy:', confMatrix.accuracy());
+print('Kappa Coefficient:', confMatrix.kappa());
+print('Producer\'s Accuracy:', confMatrix.producersAccuracy());
+print('User\'s Accuracy:', confMatrix.consumersAccuracy());

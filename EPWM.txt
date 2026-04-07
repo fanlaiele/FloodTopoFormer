@@ -1,0 +1,103 @@
+var roi = table;
+Map.centerObject(roi, 9);
+Map.addLayer(roi.style({color: 'red', fillColor: '00000000'}), {}, '研究区边界');
+
+var gswm = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');  // 版本 1.4
+
+var pwm_gswm = gswm.select('occurrence')
+                   .gt(60)
+                   .clip(roi)
+                   .reproject({crs: 'EPSG:4326', scale: 30});
+
+var s1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+            .filterBounds(roi)
+            .filterDate('2016-01-01', '2024-12-31')
+            .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+            .filter(ee.Filter.eq('instrumentMode', 'IW'))
+            .select('VH');
+
+function applyLeeFilter(image) {
+  var vh = image.select('VH');
+  var mean = vh.focal_mean({radius: 30, units: 'meters'});
+  return image.addBands(mean.rename('VH'), null, true);
+}
+
+var s1_filtered = s1.map(applyLeeFilter);
+
+print('SAR 影像数量：', s1.size());
+print('影像时间列表：', s1.aggregate_array('system:time_start').map(function(t){
+  return ee.Date(t).format('YYYY-MM-dd');
+}));
+
+function otsuThreshold(image) {
+  var histDict = image.reduceRegion({
+    reducer: ee.Reducer.histogram(),
+    geometry: roi,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+
+  var hist = ee.Dictionary(histDict.get('VH'));
+
+  var threshold = ee.Algorithms.If(hist.contains('histogram'), (function () {
+    var counts = ee.Array(hist.get('histogram'));
+    var means = ee.Array(hist.get('bucketMeans'));
+    var size = counts.length().get([0]);
+
+    var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var meanTotal = sum.divide(total);
+
+    var bss = ee.List.sequence(1, size.subtract(1)).map(function (i) {
+      i = ee.Number(i);
+      var counts1 = counts.slice(0, 0, i);
+      var counts2 = counts.slice(0, i);
+      var means1 = means.slice(0, 0, i);
+      var means2 = means.slice(0, i);
+      var weight1 = counts1.reduce(ee.Reducer.sum(), [0]).get([0]);
+      var weight2 = counts2.reduce(ee.Reducer.sum(), [0]).get([0]);
+      var mean1 = means1.multiply(counts1).reduce(ee.Reducer.sum(), [0]).get([0]).divide(weight1);
+      var mean2 = means2.multiply(counts2).reduce(ee.Reducer.sum(), [0]).get([0]).divide(weight2);
+      return weight1.multiply(mean1.subtract(meanTotal).pow(2))
+        .add(weight2.multiply(mean2.subtract(meanTotal).pow(2)));
+    });
+
+    var maxBss = ee.Array(bss).reduce(ee.Reducer.max(), [0]);
+    var index = ee.Array(bss).toList().indexOf(maxBss.get([0]));
+    var threshold = means.toList().get(index);
+
+    return threshold;
+  })(), ee.Number(-18));  // 默认阈值
+
+  threshold = ee.Number(threshold);
+  var water = image.lt(threshold);
+  return water.rename('water').copyProperties(image, image.propertyNames());
+}
+
+var waterMasks = s1_filtered.map(otsuThreshold);
+
+var validMasks = waterMasks.map(function(img) {
+  return img.mask().rename('valid');
+});
+
+var waterCount = waterMasks.sum();
+var validCount = validMasks.sum();
+var freq = waterCount.divide(validCount).rename('waterFreq');
+
+var pwm_s1 = freq.updateMask(validCount.gte(5)).gt(0.8).selfMask().clip(roi);
+
+var dem = ee.Image('MERIT/DEM/v1_0_3').select('dem').clip(roi);
+var slope = ee.Terrain.slope(dem);
+var hand = ee.Image('MERIT/Hydro/v1_0_1').select('hnd').clip(roi);
+var slopeMask = slope.lte(5);
+var handMask = hand.lte(10);
+
+var pwm_s1_filtered = pwm_s1
+  .updateMask(slopeMask)
+  .updateMask(handMask);
+Map.addLayer(pwm_s1_filtered, {palette: ['cyan']}, 'S1 高频水体 + 约束');
+
+var epwm = pwm_gswm.or(pwm_s1_filtered).selfMask();
+Map.addLayer(epwm, {palette: ['yellow']}, 'EPWM - GSWM + S1');
+
