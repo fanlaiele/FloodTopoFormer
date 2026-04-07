@@ -1,1 +1,1 @@
-# FloodTopoFormer
+FloodTopoFormer is an integrated geospatial tool for urban flood extraction, topographic correction, and exposure assessment using multi-source remote sensing data. It combines Sentinel-1/2 imagery, an enhanced permanent water mask, and Transformer-based DEM correction to support urban flood analysis.
