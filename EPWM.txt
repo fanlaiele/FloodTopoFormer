@@ -5,7 +5,7 @@ Map.addLayer(roi.style({color: 'red', fillColor: '00000000'}), {}, '研究区边
 var gswm = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');  // 版本 1.4
 
 var pwm_gswm = gswm.select('occurrence')
-                   .gt(60)
+                   .gt(80)
                    .clip(roi)
                    .reproject({crs: 'EPSG:4326', scale: 30});
 
